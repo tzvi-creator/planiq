@@ -8,7 +8,7 @@ import { planImageForAI } from '@/lib/clientFiles';
 import { bboxPx, centroid, fmt, pointInPoly, polyAreaPx, roomMetrics } from '@/lib/geometry';
 import { DISCIPLINES, FIXTURE_KINDS, OPENING_TYPES, ROOM_TYPES, type Analysis, type Pt, type Room, type RoomType } from '@/lib/types';
 
-type Mode = 'select' | 'measure' | 'calibrate' | 'draw';
+type Mode = 'select' | 'measure' | 'calibrate' | 'draw' | 'region';
 type Label = 'none' | 'area' | 'dims' | 'both';
 type Sel = { kind: 'room' | 'opening' | 'fixture'; id: string } | null;
 
@@ -101,11 +101,15 @@ function Viewer() {
     return hits[0] ? { kind: 'room', id: hits[0].id } : null;
   }
 
+  const [region, setRegion] = useState<{ a: Pt; b: Pt } | null>(null);
+  const regionDrag = useRef(false);
   function onPointerDown(e: React.PointerEvent) {
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    if (mode === 'region' && plan) { regionDrag.current = true; const p = toNorm(e.clientX, e.clientY); setRegion({ a: p, b: p }); return; }
     drag.current = { sx: e.clientX, sy: e.clientY, vx: view.x, vy: view.y, moved: false };
   }
   function onPointerMove(e: React.PointerEvent) {
+    if (regionDrag.current) { const p = toNorm(e.clientX, e.clientY); setRegion((r) => (r ? { ...r, b: p } : r)); return; }
     const d = drag.current;
     if (!d) return;
     const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
@@ -113,6 +117,11 @@ function Viewer() {
     if (d.moved) setView((v) => ({ ...v, x: d.vx + dx, y: d.vy + dy }));
   }
   function onPointerUp(e: React.PointerEvent) {
+    if (regionDrag.current) {
+      regionDrag.current = false;
+      setRegion((r) => (r && Math.abs(r.a[0] - r.b[0]) * (plan?.width || 1) > 40 && Math.abs(r.a[1] - r.b[1]) * (plan?.height || 1) > 40 ? r : null));
+      return;
+    }
     const d = drag.current;
     drag.current = null;
     if (!d || d.moved || !plan) return;
@@ -134,13 +143,15 @@ function Viewer() {
     }
   }
 
-  async function runAI() {
+  async function runAI(useRegion = false) {
     if (!plan) return;
-    if (plan.analysis && !confirm('קיים כבר ניתוח לתכנית זו. ניתוח חדש יחליף אותו (כולל עריכות ידניות). להמשיך?')) return;
-    setBusy('ai'); setMsg({ t: 'info', s: 'ה-AI קורא את התכנית… זה עשוי לקחת עד דקה.' });
+    const rg = useRegion && region ? { x0: Math.min(region.a[0], region.b[0]), y0: Math.min(region.a[1], region.b[1]), x1: Math.max(region.a[0], region.b[0]), y1: Math.max(region.a[1], region.b[1]) } : undefined;
+    if (!rg && plan.analysis && !confirm('קיים כבר ניתוח לתכנית זו. ניתוח חדש יחליף אותו (כולל עריכות ידניות). להמשיך?')) return;
+    if (dirty && !confirm('יש שינויים שלא נשמרו שיאבדו בניתוח. להמשיך?')) return;
+    setBusy('ai'); setMsg({ t: 'info', s: rg ? 'ה-AI קורא את האזור שנבחר… עד דקה.' : 'ה-AI קורא את התכנית… זה עשוי לקחת עד דקה.' });
     try {
-      const image = await planImageForAI(plan.id);
-      const r = await fetch(`/api/plans/${plan.id}/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: image, scaleRatio: plan.scale_ratio, hint }) });
+      const image = await planImageForAI(plan.id, rg ? 2200 : 2000, rg);
+      const r = await fetch(`/api/plans/${plan.id}/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: image, scaleRatio: plan.scale_ratio, hint, region: rg }) });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || 'הניתוח נכשל');
       patchPlan(j.plan); setUnits(j.units);
@@ -248,9 +259,13 @@ function Viewer() {
               <label className="fld">הערה ל-AI (לא חובה)
                 <input value={hint} onChange={(e) => setHint(e.target.value)} placeholder="למשל: זו דירת 4 חדרים, קנה מידה 1:100" />
               </label>
-              <button className="btn primary" style={{ width: '100%', marginTop: 8 }} onClick={runAI} disabled={!!busy || !isImage}>
-                {busy === 'ai' ? <><span className="spin" /> מנתח…</> : '🤖 נתח תכנית עם AI'}
+              <button className="btn primary" style={{ width: '100%', marginTop: 8 }} onClick={() => runAI(false)} disabled={!!busy || !isImage}>
+                {busy === 'ai' ? <><span className="spin" /> מנתח…</> : '🤖 נתח את כל התכנית עם AI'}
               </button>
+              <button className="btn" style={{ width: '100%', marginTop: 6 }} onClick={() => runAI(true)} disabled={!!busy || !region}>
+                🤖 נתח רק את האזור המסומן {region ? '' : '(סמנו אזור קודם)'}
+              </button>
+              <p className="muted small" style={{ marginTop: 6 }}>גיליון עמוס עם כמה דירות/בניינים? לחצו "▭ בחירת אזור", גררו מסגרת סביב דירה אחת ונתחו אותה – כך התוצאה מדויקת בהרבה. כל אזור נוסף מתווסף לניתוח הקיים.</p>
               {!isImage && <p className="small muted">הקובץ אינו תמונה/PDF – המירו ל-PDF כדי לנתח.</p>}
             </>
           )}
@@ -296,7 +311,7 @@ function Viewer() {
         {/* ---------- אמצע: הבד ---------- */}
         <div>
           <div className="row noprint" style={{ marginBottom: 8 }}>
-            {([['select', '👆 בחירה'], ['measure', '📏 מדידה'], ['calibrate', '⚖ כיול קנה מידה'], ['draw', '✏ ציור חלל']] as [Mode, string][]).map(([m, t]) => (
+            {([['select', '👆 בחירה'], ['region', '▭ בחירת אזור לניתוח'], ['measure', '📏 מדידה'], ['calibrate', '⚖ כיול קנה מידה'], ['draw', '✏ ציור חלל']] as [Mode, string][]).map(([m, t]) => (
               <button key={m} className={`btn sm${mode === m ? ' active' : ''}`} onClick={() => { setMode(m); setPts([]); }}>{t}</button>
             ))}
             {mode === 'draw' && <button className="btn sm primary" onClick={finishDraw}>סיום ציור</button>}
@@ -307,6 +322,7 @@ function Viewer() {
           </div>
           {mode !== 'select' && (
             <div className="banner info">
+              {mode === 'region' && 'גררו מסגרת סביב האזור לניתוח (למשל דירה אחת), ואז לחצו "נתח רק את האזור המסומן" בצד ימין. אפשר להתקרב עם הגלגלת לפני הסימון.'}
               {mode === 'measure' && 'מדידה: לחצו על שתי נקודות בתכנית.'}
               {mode === 'calibrate' && `כיול: לחצו על שתי נקודות במרחק ידוע (${pts.length}/2).`}
               {mode === 'draw' && `ציור: לחצו על פינות החלל (${pts.length} נקודות), ואז "סיום ציור" או Enter.`}
@@ -372,6 +388,11 @@ function Viewer() {
                         {mode === 'measure' && <text x={(pts[0][0] + pts[1][0]) / 2 * plan.width} y={(pts[0][1] + pts[1][1]) / 2 * plan.height - 8 / view.k} textAnchor="middle" fontSize={fs * 1.2} fontWeight={800} fill="#d32f2f" stroke="#fff" strokeWidth={fs / 4} paintOrder="stroke">{measureText(pts[0], pts[1])}</text>}
                       </>}
                     </g>
+                  )}
+                  {region && (
+                    <rect x={Math.min(region.a[0], region.b[0]) * plan.width} y={Math.min(region.a[1], region.b[1]) * plan.height}
+                      width={Math.abs(region.a[0] - region.b[0]) * plan.width} height={Math.abs(region.a[1] - region.b[1]) * plan.height}
+                      fill="#2b6cb022" stroke="#2b6cb0" strokeWidth={3 / view.k} strokeDasharray={`${10 / view.k} ${6 / view.k}`} />
                   )}
                   {mode === 'draw' && pts.length > 0 && (
                     <g>

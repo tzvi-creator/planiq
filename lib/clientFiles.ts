@@ -24,7 +24,8 @@ export function loadPdfJs(): Promise<any> {
   return pdfjsPromise;
 }
 
-export interface Rendered { blob: Blob; width: number; height: number; paperWidthMm: number | null; dataUrl: string }
+export interface TextItem { t: string; x: number; y: number }
+export interface Rendered { blob: Blob; width: number; height: number; paperWidthMm: number | null; dataUrl: string; texts?: TextItem[] }
 
 const MAX_BYTES = 4.0 * 1024 * 1024;
 
@@ -58,10 +59,26 @@ export async function renderPdfPage(file: File, pageNum: number, maxDim = 3200):
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvasContext: ctx, viewport: vp }).promise;
   const blob = await canvasToJpeg(canvas);
+  // טקסט מדויק משכבת הטקסט של ה-PDF (שמות חללים, מידות, סימוני פתחים) עם מיקום מנורמלי
+  let texts: TextItem[] = [];
+  try {
+    const tc = await page.getTextContent();
+    for (const it of tc.items as any[]) {
+      const s = String(it.str || '').trim();
+      if (!s) continue;
+      const [px, py] = vp.convertToViewportPoint(it.transform[4], it.transform[5]);
+      const w = (it.width || 0) * scale, h = (it.height || 0) * scale;
+      const x = (px + w / 2) / canvas.width, y = (py - h / 2) / canvas.height;
+      if (x < 0 || x > 1 || y < 0 || y > 1) continue;
+      texts.push({ t: s.slice(0, 60), x: Math.round(x * 10000) / 10000, y: Math.round(y * 10000) / 10000 });
+    }
+    if (texts.length > 6000) texts = texts.slice(0, 6000);
+  } catch { texts = []; }
   return {
     blob, width: canvas.width, height: canvas.height,
     paperWidthMm: (v1.width / 72) * 25.4, // רוחב העמוד במ"מ (1pt = 1/72")
     dataUrl: canvas.toDataURL('image/jpeg', 0.8),
+    texts,
   };
 }
 
@@ -82,21 +99,26 @@ export async function prepareImage(file: File, maxDim = 3200): Promise<Rendered>
 }
 
 // תמונה לניתוח AI מתוך כתובת תכנית שמורה (תומך גם ב-SVG)
-export async function planImageForAI(planId: number, maxDim = 2000): Promise<string> {
+export interface Region { x0: number; y0: number; x1: number; y1: number } // מנורמל
+
+export async function planImageForAI(planId: number, maxDim = 2000, region?: Region): Promise<string> {
   const img = await new Promise<HTMLImageElement>((res, rej) => {
     const i = new Image();
     i.onload = () => res(i);
     i.onerror = () => rej(new Error('טעינת התכנית נכשלה'));
     i.src = `/api/plans/${planId}/file`;
   });
-  const w = img.naturalWidth || 1600, h = img.naturalHeight || 1200;
-  const k = Math.min(1, maxDim / Math.max(w, h)) || 1;
+  const W = img.naturalWidth || 1600, H = img.naturalHeight || 1200;
+  // חיתוך אזור ברזולוציה מקורית (אפשר להגדיל עד פי 2 כדי שהמודל יראה פרטים קטנים)
+  const sx = region ? region.x0 * W : 0, sy = region ? region.y0 * H : 0;
+  const sw = region ? (region.x1 - region.x0) * W : W, sh = region ? (region.y1 - region.y0) * H : H;
+  const k = region ? Math.min(2, maxDim / Math.max(sw, sh)) : Math.min(1, maxDim / Math.max(sw, sh)) || 1;
   const canvas = document.createElement('canvas');
-  canvas.width = Math.round(w * k);
-  canvas.height = Math.round(h * k);
+  canvas.width = Math.max(1, Math.round(sw * k));
+  canvas.height = Math.max(1, Math.round(sh * k));
   const ctx = canvas.getContext('2d')!;
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL('image/jpeg', 0.85);
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/jpeg', 0.88);
 }

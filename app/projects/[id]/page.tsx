@@ -174,6 +174,7 @@ function UploadModal({ onClose }: { onClose: () => void }) {
         fd.set('mime', 'image/jpeg');
         fd.set('width', String(r.width)); fd.set('height', String(r.height));
         if (r.paperWidthMm) fd.set('paperWidthMm', String(r.paperWidthMm));
+        if (r.texts?.length) fd.set('texts', JSON.stringify(r.texts));
       }
       setMsg('מעלה…');
       const res = await fetch('/api/plans', { method: 'POST', body: fd });

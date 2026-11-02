@@ -50,6 +50,22 @@ export async function POST(req: NextRequest, ctx: Ctx) {
   const plan = await q1<any>(`select ${PLAN_COLS} from plans where id=$1`, [id]);
   if (!plan) return NextResponse.json({ error: 'תכנית לא נמצאה' }, { status: 404 });
 
+  // אזור לניתוח (מנורמל ביחס לכל התכנית) – מאפשר לנתח דירה אחת מתוך גיליון עמוס
+  const rg = body.region && Number(body.region.x1) > Number(body.region.x0) && Number(body.region.y1) > Number(body.region.y0)
+    ? { x0: clamp01(body.region.x0), y0: clamp01(body.region.y0), x1: clamp01(body.region.x1), y1: clamp01(body.region.y1) } : null;
+  const toFull = (p: Pt): Pt => (rg ? [rg.x0 + p[0] * (rg.x1 - rg.x0), rg.y0 + p[1] * (rg.y1 - rg.y0)] : p);
+
+  // טקסט מדויק מה-PDF (אם נשמר בהעלאה), מומר לקואורדינטות התמונה שנשלחת
+  let textHint = '';
+  const tx = await q1<any>('select texts from plans where id=$1', [id]);
+  if (Array.isArray(tx?.texts)) {
+    const items = (tx.texts as { t: string; x: number; y: number }[])
+      .filter((i) => !rg || (i.x >= rg.x0 && i.x <= rg.x1 && i.y >= rg.y0 && i.y <= rg.y1))
+      .map((i) => (rg ? { t: i.t, x: (i.x - rg.x0) / (rg.x1 - rg.x0), y: (i.y - rg.y0) / (rg.y1 - rg.y0) } : i))
+      .slice(0, 500);
+    if (items.length) textHint = `\nטקסטים שנקראו ישירות מקובץ ה-PDF (מדויקים, עם מיקום x,y בתוך התמונה) – השתמש בהם לשמות חללים, שטחים, מידות וסימוני פתחים (בישראל "80 / 210" ליד דלת = רוחב 80 ס"מ, גובה 210 ס"מ):\n` + items.map((i) => `${i.t}@(${i.x.toFixed(3)},${i.y.toFixed(3)})`).join('  ');
+  }
+
   let raw: any;
   try {
     const r = await aiClient().chat.completions.create({
@@ -62,7 +78,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         {
           role: 'user',
           content: [
-            { type: 'text', text: `נתח את התכנית. שם התכנית: ${plan.name}. תחום: ${plan.discipline}. ${body.scaleRatio ? `קנה מידה מוצהר: 1:${body.scaleRatio}.` : ''} ${body.hint || ''}` },
+            { type: 'text', text: `נתח את התכנית. שם התכנית: ${plan.name}. תחום: ${plan.discipline}. ${body.scaleRatio ? `קנה מידה מוצהר: 1:${body.scaleRatio}.` : ''} ${rg ? 'התמונה היא חיתוך של אזור אחד (דירה/יחידה) מתוך גיליון גדול – נתח רק את מה שבתוך החיתוך, התעלם מחותמת, הערות, קווי מגרש ומידות חיצוניות, והחזר קואורדינטות ביחס לחיתוך.' : 'אם זה גיליון גדול עם כמה בניינים/קומות, נתח רק מה שניתן לקרוא בבירור.'} ${body.hint || ''}${textHint}` },
             { type: 'image_url', image_url: { url: image, detail: 'high' } },
           ],
         },
@@ -86,15 +102,17 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     return nu.id as number;
   };
 
+  // בניתוח אזור מוסיפים לניתוח הקיים, ולכן מזהים ייחודיים לריצה זו
+  const tag = rg || body.merge ? Date.now().toString(36) : '';
   const rooms: Analysis['rooms'] = [];
   for (const [i, r] of (raw.rooms || []).entries()) {
     if (!Array.isArray(r.polygon) || r.polygon.length < 3) continue;
     rooms.push({
-      id: `r${i + 1}`,
+      id: `r${tag}${i + 1}`,
       name: String(r.name || `חלל ${i + 1}`),
       type: (ROOM_TYPES as any)[r.type] ? r.type : 'other',
       unitId: await getUnit(r.unit),
-      polygon: r.polygon.map(toPt),
+      polygon: r.polygon.map(toPt).map(toFull),
     });
   }
   const roomByName = (n?: string | null) => (n ? rooms.find((x) => x.name === n)?.id : undefined);
@@ -103,23 +121,35 @@ export async function POST(req: NextRequest, ctx: Ctx) {
   const openings: Analysis['openings'] = (raw.openings || []).map((o: any, i: number) => {
     const type = (OPENING_TYPES as any)[o.type] ? o.type : 'other';
     const hasW = Number(o.widthM) > 0, hasH = Number(o.heightM) > 0;
+    const [ox, oy] = toFull([clamp01(o.x), clamp01(o.y)]);
     return {
-      id: `o${i + 1}`, type, x: clamp01(o.x), y: clamp01(o.y),
+      id: `o${tag}${i + 1}`, type, x: ox, y: oy,
       wM: hasW ? Number(o.widthM) : DEF_W[type], hM: hasH ? Number(o.heightM) : DEF_H[type],
       tag: o.tag || undefined, room: roomByName(o.room), assumed: !(hasW && hasH),
     };
   });
   const fixtures: Analysis['fixtures'] = (raw.fixtures || [])
     .filter((f: any) => (FIXTURE_KINDS as any)[f.kind])
-    .map((f: any, i: number) => ({ id: `f${i + 1}`, kind: f.kind, x: clamp01(f.x), y: clamp01(f.y), room: roomByName(f.room) }));
+    .map((f: any, i: number) => { const [fx, fy] = toFull([clamp01(f.x), clamp01(f.y)]); return { id: `f${tag}${i + 1}`, kind: f.kind, x: fx, y: fy, room: roomByName(f.room) }; });
   const elements = (raw.elements || [])
     .filter((e: any) => Array.isArray(e.polygon) && e.polygon.length >= 3)
-    .map((e: any, i: number) => ({ id: `e${i + 1}`, type: ['column', 'beam', 'shearwall'].includes(e.type) ? e.type : 'column', polygon: e.polygon.map(toPt) }));
+    .map((e: any, i: number) => ({ id: `e${tag}${i + 1}`, type: ['column', 'beam', 'shearwall'].includes(e.type) ? e.type : 'column', polygon: e.polygon.map(toPt).map(toFull) }));
 
-  const analysis: Analysis = {
+  let analysis: Analysis = {
     version: 1, source: 'ai', summary: raw.summary, scaleNote: raw.scale?.note,
     rooms, openings, fixtures, elements, warnings: raw.warnings || [],
   };
+  if (!rooms.length && !openings.length && !fixtures.length && !elements.length)
+    analysis.warnings!.push(rg ? 'לא זוהו אלמנטים באזור שנבחר. נסו אזור קטן וברור יותר (דירה אחת).' : 'לא זוהו אלמנטים בגיליון כולו. סמנו אזור (דירה אחת) ונתחו אותו.');
+  // מיזוג עם ניתוח קיים (ניתוח אזור, או כשהתבקש במפורש)
+  const prev: Analysis | null = plan.analysis;
+  if (prev && (rg || body.merge)) {
+    analysis = {
+      ...prev, source: 'ai', summary: analysis.summary || prev.summary,
+      rooms: [...prev.rooms, ...rooms], openings: [...prev.openings, ...openings], fixtures: [...prev.fixtures, ...fixtures],
+      elements: [...(prev.elements || []), ...elements], warnings: analysis.warnings,
+    };
+  }
 
   // קנה מידה: ידני / seed נשמרים; אחרת יחס+גודל נייר; אחרת מידה מצוינת על ידי ה-AI
   let mpp: number | null = plan.mpp, src: string | null = plan.scale_source, ratio = plan.scale_ratio;
@@ -127,7 +157,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const aiRatio = Number(raw.scale?.ratio) || null;
     ratio = ratio || aiRatio;
     if (ratio && plan.paper_width_mm) { mpp = ((plan.paper_width_mm / 1000) * ratio) / plan.width; src = 'ratio'; }
-    else if (raw.scale?.referenceDimension?.meters > 0) {
+    else if (!rg && raw.scale?.referenceDimension?.meters > 0) {
       const { p1, p2, meters } = raw.scale.referenceDimension;
       const dpx = Math.hypot((clamp01(p2?.[0]) - clamp01(p1?.[0])) * plan.width, (clamp01(p2?.[1]) - clamp01(p1?.[1])) * plan.height);
       if (dpx > 5) { mpp = Number(meters) / dpx; src = 'ai-dimension'; }

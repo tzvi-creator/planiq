@@ -17,11 +17,14 @@ export async function POST(req: NextRequest) {
   const ratio = num('scaleRatio'), paper = num('paperWidthMm');
   let mpp: number | null = null, src: string | null = null;
   if (ratio && paper) { mpp = ((paper / 1000) * ratio) / width; src = 'ratio'; }
+  let texts: string | null = null;
+  const rawTexts = fd.get('texts');
+  if (typeof rawTexts === 'string' && rawTexts.length < 600_000) { try { JSON.parse(rawTexts); texts = rawTexts; } catch {} }
   const row = await q1(
-    `insert into plans(project_id,floor_id,name,filename,discipline,kind,mime,data,width,height,paper_width_mm,scale_ratio,mpp,scale_source)
-     values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning ${PLAN_COLS}`,
+    `insert into plans(project_id,floor_id,name,filename,discipline,kind,mime,data,width,height,paper_width_mm,scale_ratio,mpp,scale_source,texts)
+     values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning ${PLAN_COLS}`,
     [projectId, num('floorId'), String(fd.get('name') || file.name), String(fd.get('filename') || file.name), String(fd.get('discipline') || 'architecture'),
-      String(fd.get('kind') || 'plan'), String(fd.get('mime') || file.type || 'application/octet-stream'), buf, width, height, paper, ratio, mpp, src],
+      String(fd.get('kind') || 'plan'), String(fd.get('mime') || file.type || 'application/octet-stream'), buf, width, height, paper, ratio, mpp, src, texts],
   );
   return NextResponse.json(row);
 }

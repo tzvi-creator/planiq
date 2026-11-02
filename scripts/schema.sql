@@ -72,3 +72,5 @@ create table if not exists reports (
   content jsonb not null,
   created_at timestamptz not null default now()
 );
+
+alter table plans add column if not exists texts jsonb;
