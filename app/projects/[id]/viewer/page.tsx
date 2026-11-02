@@ -5,6 +5,7 @@ import Help from '@/components/Help';
 import { useProject } from '@/components/ProjectProvider';
 import { writeCtx } from '@/components/AgentChat';
 import { planImageForAI } from '@/lib/clientFiles';
+import { detectRooms } from '@/lib/roomDetect';
 import { bboxPx, centroid, fmt, pointInPoly, polyAreaPx, roomMetrics } from '@/lib/geometry';
 import { DISCIPLINES, FIXTURE_KINDS, OPENING_TYPES, ROOM_TYPES, type Analysis, type Pt, type Room, type RoomType } from '@/lib/types';
 
@@ -161,6 +162,92 @@ function Viewer() {
     setBusy('');
   }
 
+  // שלב 1: זיהוי גיאומטרי של חללים לפי הקירות בתמונה (ללא AI)
+  async function detectGeometry() {
+    if (!plan) return;
+    if (!plan.mpp) { setMsg({ t: 'bad', s: 'כדי לזהות חללים צריך קנה מידה. השתמשו ב"כיול קנה מידה" או הזינו קנה מידה במסך הסקירה.' }); return; }
+    const rg = region ? { x0: Math.min(region.a[0], region.b[0]), y0: Math.min(region.a[1], region.b[1]), x1: Math.max(region.a[0], region.b[0]), y1: Math.max(region.a[1], region.b[1]) } : { x0: 0, y0: 0, x1: 1, y1: 1 };
+    const existing = draft?.rooms.filter((r) => { const c = centroid(r.polygon); return c[0] >= rg.x0 && c[0] <= rg.x1 && c[1] >= rg.y0 && c[1] <= rg.y1; }) ?? [];
+    if (existing.length && !confirm(`באזור זה כבר יש ${existing.length} חללים. הם יוחלפו בחללים שיזוהו (השינוי לא נשמר עד לחיצה על "שמירה"). להמשיך?`)) return;
+    setBusy('geo'); setMsg({ t: 'info', s: 'מזהה קירות וחללים… (כמה שניות)' });
+    try {
+      const img = await new Promise<HTMLImageElement>((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('טעינת התכנית נכשלה')); i.src = `/api/plans/${plan.id}/file`; });
+      const W = img.naturalWidth, H = img.naturalHeight;
+      const sx = Math.round(rg.x0 * W), sy = Math.round(rg.y0 * H), sw = Math.max(10, Math.round((rg.x1 - rg.x0) * W)), sh = Math.max(10, Math.round((rg.y1 - rg.y0) * H));
+      const cv = document.createElement('canvas'); cv.width = sw; cv.height = sh;
+      const cx = cv.getContext('2d', { willReadFrequently: true })!;
+      cx.fillStyle = '#fff'; cx.fillRect(0, 0, sw, sh); cx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+      await new Promise((r) => setTimeout(r, 30));
+      const found = detectRooms(cx.getImageData(0, 0, sw, sh), { mpp: plan.mpp });
+      if (!found.length) { setMsg({ t: 'bad', s: 'לא זוהו חללים. נסו אזור קטן וברור יותר, או בדקו את קנה המידה.' }); setBusy(''); return; }
+      const mpp = plan.mpp;
+      const list = found.map((r, i) => {
+        const polygon = r.poly.map(([px, py]) => [(sx + px) / W, (sy + py) / H] as Pt);
+        const b = bboxPx(polygon, W, H);
+        const dims = [b.w * mpp, b.h * mpp].sort((a, c) => a - c);
+        return { n: i + 1, polygon, areaM2: polyAreaPx(polygon, W, H) * mpp * mpp, widthM: dims[0], lengthM: dims[1], border: r.touchesBorder };
+      });
+      // שלב 1 מסתיים כאן: אזורים מועמדים בלבד, ללא שם וייעוד, עד לאישור המשתמש
+      const stamp = Date.now().toString(36);
+      const cand: Room[] = list.map((x) => ({ id: `g${stamp}-${x.n}`, name: `אזור ${x.n}`, type: 'other' as RoomType, unitId: unitId ?? null, polygon: x.polygon, status: 'candidate' as const }));
+      const drop = new Set(existing.map((e) => e.id));
+      mut((a) => { a.rooms = [...a.rooms.filter((q) => !drop.has(q.id)), ...cand]; });
+      setMsg({ t: 'ok', s: `שלב 1: זוהו ${cand.length} אזורים (מסומנים בכתום מקווקו). עברו על הצורות: מחקו אזורים שאינם חללים, ואז אשרו (כפתור "אשר" בפרטי האזור או "אשר את כולם"). רק אחרי אישור אפשר לעבור לשלב 2.` });
+    } catch (e: any) { setMsg({ t: 'bad', s: e.message }); }
+    setBusy('');
+  }
+
+  function approveRooms(ids?: string[]) {
+    mut((a) => { for (const r of a.rooms) if (r.status === 'candidate' && (!ids || ids.includes(r.id))) r.status = 'approved'; });
+  }
+
+  // שלב 2: מתן שם וייעוד לחללים שאושרו (AI + טקסט מה-PDF), בלי לשנות את הגיאומטריה
+  async function classifyApproved() {
+    if (!plan || !draft) return;
+    const targets = draft.rooms.filter((r) => r.status !== 'candidate' && r.type === 'other' && /^אזור \d+$/.test(r.name));
+    if (!targets.length) { setMsg({ t: 'info', s: 'אין חללים מאושרים שממתינים לזיהוי. אשרו אזורים בשלב 1 תחילה.' }); return; }
+    setBusy('cls'); setMsg({ t: 'info', s: `שלב 2: ה-AI נותן שם וייעוד ל-${targets.length} חללים…` });
+    try {
+      const img = await new Promise<HTMLImageElement>((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('טעינת התכנית נכשלה')); i.src = `/api/plans/${plan.id}/file`; });
+      const W = img.naturalWidth, H = img.naturalHeight, mpp = plan.mpp || 0;
+      const all = targets.flatMap((r) => r.polygon);
+      const b = bboxPx(all, W, H), pad = 0.03 * Math.max(b.w, b.h);
+      const sx = Math.max(0, Math.round(b.x0 - pad)), sy = Math.max(0, Math.round(b.y0 - pad));
+      const sw = Math.min(W - sx, Math.round(b.w + 2 * pad)), sh = Math.min(H - sy, Math.round(b.h + 2 * pad));
+      const k = Math.min(2, 1700 / Math.max(sw, sh));
+      const ov = document.createElement('canvas'); ov.width = Math.round(sw * k); ov.height = Math.round(sh * k);
+      const o = ov.getContext('2d')!;
+      o.fillStyle = '#fff'; o.fillRect(0, 0, ov.width, ov.height); o.drawImage(img, sx, sy, sw, sh, 0, 0, ov.width, ov.height);
+      const cols = ['#e53935', '#1e88e5', '#43a047', '#fb8c00', '#8e24aa', '#00897b', '#6d4c41', '#d81b60'];
+      const payload = targets.map((r, i) => {
+        const n = i + 1, m = roomMetrics(r, plan);
+        o.beginPath();
+        r.polygon.forEach(([x, y], j) => { const px = (x * W - sx) * k, py = (y * H - sy) * k; j ? o.lineTo(px, py) : o.moveTo(px, py); });
+        o.closePath(); o.fillStyle = cols[i % 8] + '40'; o.fill(); o.lineWidth = 2; o.strokeStyle = cols[i % 8]; o.stroke();
+        const c = centroid(r.polygon);
+        o.font = 'bold 22px Arial'; o.fillStyle = '#000'; o.strokeStyle = '#fff'; o.lineWidth = 4;
+        o.strokeText(String(n), (c[0] * W - sx) * k - 8, (c[1] * H - sy) * k + 8); o.fillText(String(n), (c[0] * W - sx) * k - 8, (c[1] * H - sy) * k + 8);
+        return { n, polygon: r.polygon, areaM2: m?.areaM2 ?? 0, widthM: m?.widthM ?? 0, lengthM: m?.lengthM ?? 0 };
+      });
+      const r = await fetch(`/api/plans/${plan.id}/classify`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: ov.toDataURL('image/jpeg', 0.85), rooms: payload }) });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'הסיווג נכשל');
+      const byN: Record<number, { name: string; type: RoomType; skip: boolean }> = {};
+      for (const x of j.rooms) byN[x.n] = x;
+      mut((a) => {
+        targets.forEach((t, i) => {
+          const c = byN[i + 1];
+          const room = a.rooms.find((q) => q.id === t.id);
+          if (!room || !c) return;
+          if (c.skip) { room.note = 'ה-AI סימן כלא-חלל – בדקו ומחקו אם צריך'; return; }
+          room.name = c.name || room.name; room.type = c.type;
+        });
+      });
+      setMsg({ t: 'ok', s: `שלב 2 הושלם ל-${targets.length} חללים. בדקו שמות וייעוד (לחיצה על חלל מאפשרת תיקון), ואז לחצו "שמירה". ${j.notes || ''}` });
+    } catch (e: any) { setMsg({ t: 'bad', s: e.message }); }
+    setBusy('');
+  }
+
   async function save() {
     if (!plan || !draft) return;
     setBusy('save');
@@ -209,6 +296,9 @@ function Viewer() {
     });
   }, [draft, plan, metrics, data.units, unitId]);
 
+  const nCand = draft?.rooms.filter((r) => r.status === 'candidate').length ?? 0;
+  const nApproved = draft?.rooms.filter((r) => r.status === 'approved').length ?? 0;
+  const nPending = draft?.rooms.filter((r) => r.status !== 'candidate' && r.type === 'other' && /^אזור \d+$/.test(r.name)).length ?? 0;
   const selRoom = sel?.kind === 'room' ? draft?.rooms.find((r) => r.id === sel.id) : null;
   const selOpening = sel?.kind === 'opening' ? draft?.openings.find((o) => o.id === sel.id) : null;
   const selFixture = sel?.kind === 'fixture' ? draft?.fixtures.find((o) => o.id === sel.id) : null;
@@ -229,7 +319,11 @@ function Viewer() {
         intro="מסך הצפייה המרכזי: מציג את התכנית עם שכבות חללים, שטחים, מידות וייעוד כל חלל. אפשר לבקש מה-AI לנתח תכנית חדשה, לכייל קנה מידה, למדוד, ולתקן ידנית."
         items={[
           ['בחירת תכנית', 'בתיבה בצד ימין בוחרים איזו תכנית להציג. הרשימה מסוננת לפי הקומה שנבחרה בסרגל העליון.'],
-          ['🤖 נתח תכנית עם AI', 'שולח את התכנית לניתוח: זיהוי חללים וייעודם, פתחים, אביזרי חשמל/אינסטלציה וקנה מידה. התוצאה נשמרת ואפשר לתקן אותה ידנית. התוצאה היא הערכה – יש לבדוק!'],
+          ['שלב 1 – 🧱 זהה חללים לפי הקירות', 'מחלק את התכנית לאזורים לפי הקירות שמופיעים בה, בלי AI. האזורים מסומנים בכתום מקווקו ואינם נספרים בכמויות עד לאישור. מומלץ לסמן קודם אזור (דירה אחת) ולכייל קנה מידה.'],
+          ['אישור אזורים', 'לחצו על אזור כדי לאשר ("אשר אזור זה") או למחוק. "אשר את כולם" מאשר הכול. אפשר גם להוסיף חלל חסר בכלי "ציור חלל".'],
+          ['שלב 2 – 🤖 שם וייעוד', 'רק לחללים שאושרו: ה-AI מציע שם וייעוד (סלון, מטבח, ממ"ד…) לפי התכנית והטקסט שבתוכה. הגיאומטריה לא משתנה. בדקו ותקנו ידנית, ואז "שמירה".'],
+          ['שלב 3 – חישובים', 'שטחים, כמויות ובדיקת תקנים (הלשוניות למעלה) מתבססים רק על חללים שאושרו.'],
+          ['🤖 ניתוח AI מלא (ניסיוני)', 'מנסה לזהות הכול בבת אחת, כולל פתחים ואביזרים. פחות מדויק בתכניות צפופות.'],
           ['הצגה: שטח / מידות / שניהם', 'קובע מה מוצג על כל חלל. לחיצה על חלל בתכנית פותחת את הפרטים המלאים שלו בצד שמאל.'],
           ['שכבות', 'חללים (מצולעים), ייעוד (צבע ושם לפי תפקיד החלל), פתחים (דלתות/חלונות), אביזרים (חשמל ואינסטלציה), גבולות דירות.'],
           ['דירה פעילה (סרגל עליון)', 'כשנבחרה דירה – חללי הדירה מודגשים ושאר התכנית מעומעמת.'],
@@ -259,8 +353,22 @@ function Viewer() {
               <label className="fld">הערה ל-AI (לא חובה)
                 <input value={hint} onChange={(e) => setHint(e.target.value)} placeholder="למשל: זו דירת 4 חדרים, קנה מידה 1:100" />
               </label>
-              <button className="btn primary" style={{ width: '100%', marginTop: 8 }} onClick={() => runAI(false)} disabled={!!busy || !isImage}>
-                {busy === 'ai' ? <><span className="spin" /> מנתח…</> : '🤖 נתח את כל התכנית עם AI'}
+              <div className="card" style={{ margin: '8px 0 0', padding: 10, boxShadow: 'none', background: 'var(--surface-2)' }}>
+                <div className="small" style={{ fontWeight: 800, marginBottom: 6 }}>תהליך הניתוח בשלבים</div>
+                <div className="small"><b>שלב 1 – גיאומטריה</b> {nCand ? <span className="chip warn">{nCand} ממתינים לאישור</span> : nApproved ? <span className="chip ok">{nApproved} אושרו</span> : null}</div>
+                <button className="btn primary" style={{ width: '100%', marginTop: 4 }} onClick={detectGeometry} disabled={!!busy || !isImage}>
+                  {busy === 'geo' ? <><span className="spin" /> מזהה קירות…</> : `🧱 זהה חללים לפי הקירות ${region ? '(באזור המסומן)' : '(בכל התכנית)'}`}
+                </button>
+                {nCand > 0 && <button className="btn sm" style={{ width: '100%', marginTop: 4 }} onClick={() => approveRooms()}>✔ אשר את כל {nCand} האזורים</button>}
+                <div className="small" style={{ fontWeight: 700, margin: '10px 0 4px' }}>שלב 2 – שם וייעוד {nPending ? <span className="chip warn">{nPending} ממתינים</span> : null}</div>
+                <button className="btn" style={{ width: '100%' }} onClick={classifyApproved} disabled={!!busy || !nPending}>
+                  {busy === 'cls' ? <><span className="spin" /> מזהה…</> : '🤖 זהה שם וייעוד לחללים שאושרו'}
+                </button>
+                <div className="small" style={{ fontWeight: 700, margin: '10px 0 2px' }}>שלב 3 – חישובים</div>
+                <div className="muted small">שטחים, כמויות ובדיקת תקנים (הלשוניות למעלה) מתבססים רק על חללים מאושרים.</div>
+              </div>
+              <button className="btn" style={{ width: '100%', marginTop: 6 }} onClick={() => runAI(false)} disabled={!!busy || !isImage}>
+                {busy === 'ai' ? <><span className="spin" /> מנתח…</> : '🤖 ניתוח AI מלא (פתחים ואביזרים) – ניסיוני'}
               </button>
               <button className="btn" style={{ width: '100%', marginTop: 6 }} onClick={() => runAI(true)} disabled={!!busy || !region}>
                 🤖 נתח רק את האזור המסומן {region ? '' : '(סמנו אזור קודם)'}
@@ -350,7 +458,8 @@ function Viewer() {
                     const m = metrics.get(r.id);
                     const c = centroid(r.polygon);
                     const cx = c[0] * plan.width, cy = c[1] * plan.height;
-                    const color = layers.function ? ROOM_TYPES[r.type]?.color ?? '#90a4ae' : '#4a90e2';
+                    const cand = r.status === 'candidate';
+                    const color = cand ? '#f59e0b' : layers.function ? ROOM_TYPES[r.type]?.color ?? '#90a4ae' : '#4a90e2';
                     const isSel = sel?.kind === 'room' && sel.id === r.id;
                     const b = bboxPx(r.polygon, plan.width, plan.height);
                     const lines: string[] = [];
@@ -360,7 +469,8 @@ function Viewer() {
                     return (
                       <g key={r.id} opacity={on ? 1 : 0.18}>
                         <polygon points={r.polygon.map((p) => `${p[0] * plan.width},${p[1] * plan.height}`).join(' ')}
-                          fill={color} fillOpacity={isSel ? 0.55 : layers.function ? 0.32 : 0.14} stroke={isSel ? '#d32f2f' : color} strokeWidth={(isSel ? 3.5 : 1.6) / view.k} />
+                          fill={color} fillOpacity={isSel ? 0.55 : cand ? 0.2 : layers.function ? 0.32 : 0.14} stroke={isSel ? '#d32f2f' : color} strokeWidth={(isSel ? 3.5 : cand ? 2.4 : 1.6) / view.k}
+                          strokeDasharray={cand ? `${9 / view.k} ${5 / view.k}` : undefined} />
                         {lines.map((t, i) => (
                           <text key={i} x={cx} y={cy + (i - (lines.length - 1) / 2) * fs * 1.15} textAnchor="middle" dominantBaseline="middle"
                             fontSize={fs} fontWeight={i === 0 && layers.function ? 700 : 600} fill="#111" stroke="#fff" strokeWidth={fs / 4.5} paintOrder="stroke">{t}</text>
@@ -411,7 +521,13 @@ function Viewer() {
           <div className="card" style={{ margin: 0 }}>
             {selRoom ? (
               <>
-                <h3>חלל נבחר</h3>
+                <h3>{selRoom.status === 'candidate' ? 'אזור מועמד (שלב 1)' : 'חלל נבחר'}</h3>
+                {selRoom.status === 'candidate' && (
+                  <div className="banner warn">האם הצורה מתאימה לחלל אמיתי? אם כן – אשרו. אם לא – מחקו (או צרו מחדש בכלי "ציור חלל").
+                    <div className="row" style={{ marginTop: 6 }}><button className="btn sm primary" onClick={() => approveRooms([selRoom.id])}>✔ אשר אזור זה</button></div>
+                  </div>
+                )}
+                {selRoom.note && <div className="banner info">{selRoom.note}</div>}
                 <div className="grid" style={{ gap: 8 }}>
                   <label className="fld">שם<input value={selRoom.name} onChange={(e) => mut((a) => { a.rooms.find((r) => r.id === selRoom.id)!.name = e.target.value; })} /></label>
                   <label className="fld">ייעוד החלל

@@ -27,6 +27,7 @@ export function roomRows(d: ProjectData, s: Scope = {}): RoomRow[] {
   for (const p of d.plans) {
     if (p.discipline !== 'architecture' || p.kind !== 'plan' || !p.analysis) continue;
     for (const r of p.analysis.rooms) {
+      if (r.status === 'candidate') continue; // אזורים שטרם אושרו אינם נספרים
       if (!inScope(d, p, r.unitId, s)) continue;
       const m = roomMetrics(r, p);
       if (!m) continue;

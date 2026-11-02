@@ -28,6 +28,7 @@ export interface Room {
   unitId: number | null;
   polygon: Pt[];
   note?: string;
+  status?: 'candidate' | 'approved'; // candidate = אזור שזוהה גיאומטרית וממתין לאישור (לא נספר בכמויות)
 }
 
 export type OpeningType = 'door' | 'entrance' | 'window' | 'sliding' | 'other';
